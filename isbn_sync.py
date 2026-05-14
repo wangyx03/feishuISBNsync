@@ -4,30 +4,30 @@ Continuously monitors the Feishu ISBN_match sheet.
 When a new ISBN is found with no Title, it looks it up and writes back Title/Author/Condition.
 Usage: python isbn_sync.py
 """
-import requests
+import os
 import json
 import time
 import logging
-from datetime import datetime
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # =============================================
-# 配置
+# 配置（全部从 .env 读取）
 # =============================================
-FEISHU_APP_ID           = "cli_aa8e06ec73b89cd9"
-FEISHU_APP_SECRET       = "L7agGZ0EMHMIa5rr9kCWge6yyFFPlUVN"
-SPREADSHEET_TOKEN       = "ZnfVs1c8uh7n4NtWYsUcd6UCnib"   # DB Sheet
-INPUT_SPREADSHEET_TOKEN = "UAROsHnTMhnsYetPGu5cwg8on5g"   # 输入 Sheet
-SHEET_ID                = "7e7f33"                         # DB Sheet ID
-INPUT_SHEET_ID          = "caa5d1"                         # 输入 Sheet ID
+FEISHU_APP_ID           = os.getenv("FEISHU_APP_ID", "")
+FEISHU_APP_SECRET       = os.getenv("FEISHU_APP_SECRET", "")
+SPREADSHEET_TOKEN       = os.getenv("FEISHU_SPREADSHEET_TOKEN", "")
+SHEET_ID                = os.getenv("FEISHU_SHEET_ID", "")
+INPUT_SPREADSHEET_TOKEN = os.getenv("FEISHU_INPUT_SPREADSHEET_TOKEN", "")
+INPUT_SHEET_ID          = os.getenv("FEISHU_INPUT_SHEET_ID", "")
 FEISHU_BASE             = "https://open.feishu.cn/open-apis"
 
-POLL_INTERVAL = 5   # How often to check for new ISBNs (seconds)
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 
-API_KEYS = [
-    "AIzaSyD-2bPSnPRrP7ZhgqsdmxwmuVqQ6wdxWjA",
-    "AIzaSyDzmc8hhjnWZUtHBbYLxaS6SBMylaWPQ8o",
-    "",
-]
+_raw_keys = os.getenv("GOOGLE_API_KEYS", ",")
+API_KEYS = [k.strip() for k in _raw_keys.split(",")]
 
 # =============================================
 # 日志
@@ -60,7 +60,7 @@ def get_token() -> str:
     if data.get("code") != 0:
         raise RuntimeError(f"Feishu token fetch failed: {data}")
     _token_cache["token"] = data["tenant_access_token"]
-    _token_cache["expires_at"] = time.time() + 6600   # 110 minutes
+    _token_cache["expires_at"] = time.time() + 6600
     log.info("Feishu token refreshed")
     return _token_cache["token"]
 
@@ -83,7 +83,6 @@ def clean_isbn(raw) -> str:
 # Feishu Read / Write
 # =============================================
 def read_input_sheet() -> list[dict]:
-    """Read input sheet, return only rows with a non-empty ISBN"""
     r = requests.get(
         f"{FEISHU_BASE}/sheets/v2/spreadsheets/{INPUT_SPREADSHEET_TOKEN}/values/{INPUT_SHEET_ID}!A1:D5000",
         headers=headers(),
@@ -127,7 +126,6 @@ def write_back(row_num: int, title: str, author: str, condition: str):
 
 
 def save_to_db(isbn, title, author, condition):
-    """Cache result in DB sheet"""
     try:
         r = requests.get(
             f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{SHEET_ID}!A1:A5000",
@@ -151,7 +149,6 @@ def save_to_db(isbn, title, author, condition):
 
 
 def lookup_db_cache(isbn: str):
-    """Check DB cache first"""
     try:
         r = requests.get(
             f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{SHEET_ID}!A1:D5000",
@@ -204,13 +201,10 @@ def lookup_openlibrary(isbn: str):
 
 
 def resolve(isbn: str) -> tuple[str, str, str]:
-    """Return (title, author, condition). Returns ('Not Found', '', 'Not Found') if nothing found."""
-    # 1. Check DB cache
     t, a, c = lookup_db_cache(isbn)
     if t:
         return t, a, "DB"
 
-    # 2. Google Books + Open Library
     gb_title, gb_author = lookup_google(isbn)
     ol_title, ol_author = lookup_openlibrary(isbn)
 
@@ -248,7 +242,7 @@ def sync_once():
             write_back(row_num, title, author, condition)
             log.info(f"  ✅ Row {row_num} | {isbn} → {title} / {author} ({condition})")
             count += 1
-            time.sleep(0.5)   # avoid API rate limits
+            time.sleep(0.5)
         except Exception as e:
             log.error(f"  ❌ Row {row_num} | {isbn} → Error: {e}")
 
