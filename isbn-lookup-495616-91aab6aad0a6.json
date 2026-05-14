@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "isbn-lookup-495616",
+  "private_key_id": "91aab6aad0a6854ed8bb06f2bc34ecb6b2afb0b8",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDjbhF3JFHkfcLm\nFF+HMoUJqdhABFwfI5Sb57z0uuN5+NZoPL5RkCi9ZpmRpxjq7MjKyE4SS+Zp9Ubf\nFqmA1QkHjDmDOeC0Q7SEV4UgUHzB5xhTfWBBDast9WolR4IHol5K6fPvcLVnX51Q\nrYc+KZhYiQYnSIFJWDX7mBJB8KR2vJJcsVRDwuFz/ga7Aq5Vszc9BDl1YdR1QyFB\n3GwMrXtdm4zWTHSwHHwAPoEHMtNrtx40e3OwVTDz7PoMzpEmwG8GH9gG4rcMcOTm\nXrT1+pI+W7vsniGpdyaeVWJK+Jc+Fe+yOi1ImS4Z0kSYLtUQQfrXGbqQhgT2LWha\npQd4Lwx7AgMBAAECggEAAQHHla71UTKArpMa2dbj7DyHxr9zhvcZ3SzZUyi8AW9p\nckcJPVmK4ffL00TES/n7aPEabg35pFt1J7S1JcBhDLBWwC7Slgm8tAn31Behzcak\n/sL4g6E4sk3lXT/j9/5Z4NwIpp/poF5ggcRwQQVfICPkgT+wGYUzS/y1i/wxm42i\nYYnbiMzweErNz/5F1Rjt89VhGSnp1adPbZz+lhHz+R/1rLHv/UBdSH0GxfpJmFHl\n9Cdwrk7iEUwMxAPo44B7CfgA6Of5dWP5ioG8LnjM/BijLojkkO6fKV6tqXkH/Cgv\n2CCihBsSwguyw7CCrcY/VCxywqmr2ED4d+WZ5NsZvQKBgQD6qvbc9nYQLgstrYCX\nKk0vTG2Fn3wobhcMfYhfrzw7f9IsitapqV8OHRhZskXL9tBzSpNdT2SaoIAx9cWn\n6PjPDz3YftW9rj1myIvta0GAVevUbtvx3cxQzAK0d/ZX3C0ocJvlpUeHDUGGRVWG\ndjnX6ZRmEzVHxMwH902Ub5GkRwKBgQDoRI9RhQ1Z0WWYYt1DZYsKpgowyIGJtUoB\nbMJypjGKyf7IQ5Fr3t+o1X68bbjpgyuJMedZzISe/U1CXxPgfy6EqMQb19l7UztY\noxgEYbbBa32gwlx94doZnYdwX9n+z+Rdsmr7jVS2rXfETeaoMWcud37rHAiujghe\nAVmxRTN0LQKBgQCDOd9Um/4AyGn3tr375RxVJ5iqfGyeKcwNMOak2PMaXvcjdGee\nmFl35QlrY6Wgeoxz3tW44qhTPrT98qFQHumqVFtXLEcvLrlcRp7iYuT+j3yPUJ36\nR9f/cF32JlsjcdN+OT2UAmuoqurjpQZ6BwiPHOwgZ+vbr430maXWkHXZXwKBgQCA\nIeJWfGoDFKtRR6j8lzX/J94TT2l2yJYM9yzGBrzp7ckqPWwp8Ae+ohiKZpVN7NjF\nlMwmE9dNxjsq1Dyo6kCFWnzlR0xo5l+k5ERJloY1adEiMFbJ8yBYZTjkW1xtX86B\nif3OzAbhyAx8NOV7/9UGI1HW7d40PZKMGX6bdquN+QKBgFlTZmDMihhjesmNtXZP\nOKNRg16WisHZQn9oTXz1wNvwGOwtqRrSdwH/fefzFpsdY2IAOv1xTDiCEQA7YfNm\nG33ydyKsPljBdpxY+bBSotdypmAjfQh/z6eshSgEvTclDqVW/rAt6xkChme3fU7T\nevth3ggucmb+yVSzP399Q2Cz\n-----END PRIVATE KEY-----\n",
+  "client_email": "isbn-sheets@isbn-lookup-495616.iam.gserviceaccount.com",
+  "client_id": "102541850332092863280",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/isbn-sheets%40isbn-lookup-495616.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}

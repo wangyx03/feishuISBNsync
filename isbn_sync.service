@@ -1,0 +1,16 @@
+[Unit]
+Description=ISBN Auto Sync Daemon
+After=network.target
+
+[Service]
+Type=simple
+# 改成你的实际路径
+WorkingDirectory=/home/your_user/isbn_sync
+ExecStart=/home/your_user/isbn_sync/venv/bin/python isbn_sync.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
