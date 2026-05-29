@@ -254,7 +254,7 @@ def resolve(isbn: str) -> tuple[str, str, str, str]:
     """Returns (title, author, binding, condition)"""
     t, a, b, c = lookup_db_cache(isbn)
     if t:
-        return t, a, b, c  # use cached condition as-is
+        return t, a, b, "DB" 
 
     gb_title, gb_author, gb_binding = lookup_google(isbn)
     ol_title, ol_author, ol_binding = lookup_openlibrary(isbn)
