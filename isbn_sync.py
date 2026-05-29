@@ -1,7 +1,7 @@
 """
 isbn_sync.py — Auto-sync daemon
 Continuously monitors the Feishu ISBN_match sheet.
-When a new ISBN is found with no Title, it looks it up and writes back Title/Author/Condition.
+When a new ISBN is found with no Title, it looks it up and writes back Title/Author/Binding/Condition.
 Usage: python isbn_sync.py
 """
 import os
@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # =============================================
-# 配置（全部从 .env 读取）
+# Config (loaded from .env)
 # =============================================
 FEISHU_APP_ID           = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET       = os.getenv("FEISHU_APP_SECRET", "")
@@ -30,7 +30,7 @@ _raw_keys = os.getenv("GOOGLE_API_KEYS", ",")
 API_KEYS = [k.strip() for k in _raw_keys.split(",")]
 
 # =============================================
-# 日志
+# Logging
 # =============================================
 logging.basicConfig(
     level=logging.INFO,
@@ -84,7 +84,7 @@ def clean_isbn(raw) -> str:
 # =============================================
 def read_input_sheet() -> list[dict]:
     r = requests.get(
-        f"{FEISHU_BASE}/sheets/v2/spreadsheets/{INPUT_SPREADSHEET_TOKEN}/values/{INPUT_SHEET_ID}!A1:D5000",
+        f"{FEISHU_BASE}/sheets/v2/spreadsheets/{INPUT_SPREADSHEET_TOKEN}/values/{INPUT_SHEET_ID}!A1:E5000",
         headers=headers(),
         timeout=15,
     )
@@ -109,10 +109,11 @@ def read_input_sheet() -> list[dict]:
     return records
 
 
-def write_back(row_num: int, title: str, author: str, condition: str):
+def write_back(row_num: int, title: str, author: str, binding: str, condition: str):
+    """Write back four columns B:E — Title / Author / Binding / Condition"""
     payload = {"valueRange": {
-        "range": f"{INPUT_SHEET_ID}!B{row_num}:D{row_num}",
-        "values": [[title, author, condition]],
+        "range": f"{INPUT_SHEET_ID}!B{row_num}:E{row_num}",
+        "values": [[title, author, binding, condition]],
     }}
     r = requests.put(
         f"{FEISHU_BASE}/sheets/v2/spreadsheets/{INPUT_SPREADSHEET_TOKEN}/values",
@@ -125,7 +126,7 @@ def write_back(row_num: int, title: str, author: str, condition: str):
         raise RuntimeError(f"Write failed at row {row_num}: {result}")
 
 
-def save_to_db(isbn, title, author, condition):
+def save_to_db(isbn, title, author, binding, condition):
     try:
         r = requests.get(
             f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{SHEET_ID}!A1:A5000",
@@ -139,8 +140,8 @@ def save_to_db(isbn, title, author, condition):
                 f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values_append",
                 headers=headers(),
                 data=json.dumps({"valueRange": {
-                    "range": f"{SHEET_ID}!A1:D1",
-                    "values": [[isbn, title, author, condition]],
+                    "range": f"{SHEET_ID}!A1:E1",
+                    "values": [[isbn, title, author, binding, condition]],
                 }}),
                 timeout=10,
             )
@@ -151,24 +152,46 @@ def save_to_db(isbn, title, author, condition):
 def lookup_db_cache(isbn: str):
     try:
         r = requests.get(
-            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{SHEET_ID}!A1:D5000",
+            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{SHEET_ID}!A1:E5000",
             headers=headers(), timeout=10,
         )
         rows = r.json().get("data", {}).get("valueRange", {}).get("values", [])
         for row in rows[1:]:
             if row and clean_isbn(row[0]) == isbn:
-                title  = "" if len(row) < 2 or row[1] is None else str(row[1])
-                author = "" if len(row) < 3 or row[2] is None else str(row[2])
-                cond   = "" if len(row) < 4 or row[3] is None else str(row[3])
+                title   = "" if len(row) < 2 or row[1] is None else str(row[1])
+                author  = "" if len(row) < 3 or row[2] is None else str(row[2])
+                binding = "" if len(row) < 4 or row[3] is None else str(row[3])
+                cond    = "" if len(row) < 5 or row[4] is None else str(row[4])
                 if title:
-                    return title, author, cond
+                    return title, author, binding, cond
     except Exception as e:
         log.warning(f"DB cache lookup failed: {e}")
-    return None, None, None
+    return None, None, None, None
 
 # =============================================
 # API Lookup
 # =============================================
+def _parse_google_binding(info: dict, item: dict) -> str:
+    """
+    Google Books has no dedicated binding field; infer from available signals:
+    - item["saleInfo"]["isEbook"] -> True means digital edition
+    - info["printType"]           -> "BOOK" | "MAGAZINE"
+    - info["binding"]             -> present on some entries
+    For standard print books Google cannot distinguish hardcover/paperback;
+    return "" and let Open Library fill the gap.
+    """
+    sale_info = item.get("saleInfo", {})
+    if sale_info.get("isEbook"):
+        return "eBook"
+    print_type = info.get("printType", "").upper()
+    if print_type == "MAGAZINE":
+        return "Magazine"
+    binding = info.get("binding", "")
+    if binding:
+        return binding
+    return ""
+
+
 def lookup_google(isbn: str):
     for key in API_KEYS:
         url = f"https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}&country=US"
@@ -179,11 +202,31 @@ def lookup_google(isbn: str):
             if data.get("error", {}).get("code") in (429, 503):
                 continue
             if data.get("totalItems", 0) > 0:
-                info = data["items"][0]["volumeInfo"]
-                return info.get("title", ""), ", ".join(info.get("authors", []))
+                info    = data["items"][0]["volumeInfo"]
+                title   = info.get("title", "")
+                author  = ", ".join(info.get("authors", []))
+                binding = _parse_google_binding(info, data["items"][0])
+                return title, author, binding
         except Exception:
             continue
-    return None, None
+    return None, None, None
+
+
+def _ol_isbn_endpoint(isbn: str) -> str:
+    """
+    Query OL's /isbn/{isbn}.json for physical_format.
+    This endpoint redirects (302) to /books/OLxxxxxxM.json which has more complete data.
+    """
+    try:
+        resp = requests.get(
+            f"https://openlibrary.org/isbn/{isbn}.json",
+            allow_redirects=True,
+            timeout=15,
+        )
+        return resp.json().get("physical_format", "")
+    except Exception as e:
+        log.warning(f"OL isbn endpoint failed ({isbn}): {e}")
+        return ""
 
 
 def lookup_openlibrary(isbn: str):
@@ -194,20 +237,29 @@ def lookup_openlibrary(isbn: str):
         ).json()
         info = data.get(f"ISBN:{isbn}")
         if info:
-            return info.get("title", ""), ", ".join(a["name"] for a in info.get("authors", []))
+            title   = info.get("title", "")
+            author  = ", ".join(a["name"] for a in info.get("authors", []))
+            binding = info.get("physical_format", "")
+            if not binding:
+                binding = _ol_isbn_endpoint(isbn)  # fallback to /isbn/ endpoint
+            return title, author, binding
     except Exception:
         pass
-    return None, None
+    return None, None, None
 
-
-def resolve(isbn: str) -> tuple[str, str, str]:
-    t, a, c = lookup_db_cache(isbn)
+# =============================================
+# Resolve (merge both sources)
+# =============================================
+def resolve(isbn: str) -> tuple[str, str, str, str]:
+    """Returns (title, author, binding, condition)"""
+    t, a, b, c = lookup_db_cache(isbn)
     if t:
-        return t, a, "DB"
+        return t, a, b, c  # use cached condition as-is
 
-    gb_title, gb_author = lookup_google(isbn)
-    ol_title, ol_author = lookup_openlibrary(isbn)
+    gb_title, gb_author, gb_binding = lookup_google(isbn)
+    ol_title, ol_author, ol_binding = lookup_openlibrary(isbn)
 
+    # --- title / author / condition ---
     if gb_title and ol_title:
         match = gb_title.strip().lower() == ol_title.strip().lower()
         condition = "Google + OL" if match else "Mismatch"
@@ -217,10 +269,13 @@ def resolve(isbn: str) -> tuple[str, str, str]:
     elif ol_title:
         title, author, condition = ol_title, ol_author, "Open Library"
     else:
-        return "Not Found", "", "Not Found"
+        return "Not Found", "", "", "Not Found"
 
-    save_to_db(isbn, title, author, condition)
-    return title, author, condition
+    # --- binding: prefer OL (most reliable); Google only fills eBook / Magazine ---
+    binding = ol_binding or gb_binding or ""
+
+    save_to_db(isbn, title, author, binding, condition)
+    return title, author, binding, condition
 
 # =============================================
 # Main Loop
@@ -235,12 +290,12 @@ def sync_once():
     log.info(f"Found {len(pending)} ISBN(s) to look up")
     count = 0
     for r in pending:
-        isbn = r["isbn"]
+        isbn    = r["isbn"]
         row_num = r["_row"]
         try:
-            title, author, condition = resolve(isbn)
-            write_back(row_num, title, author, condition)
-            log.info(f"  ✅ Row {row_num} | {isbn} → {title} / {author} ({condition})")
+            title, author, binding, condition = resolve(isbn)
+            write_back(row_num, title, author, binding, condition)
+            log.info(f"  ✅ Row {row_num} | {isbn} → {title} / {author} [{binding}] ({condition})")
             count += 1
             time.sleep(0.5)
         except Exception as e:
