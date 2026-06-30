@@ -1,8 +1,8 @@
 """
 isbn_sync.py — Auto-sync daemon
-Continuously monitors the Feishu ISBN_match sheet.
+Continuously monitors multiple Feishu ISBN_match sheets (input sources).
 When a new ISBN is found with no Title, it looks it up and writes back Title/Author/Binding/Condition.
-Date/Language/Pages are stored in the DB cache only.
+Date/Language/Pages are stored in the shared DB cache only.
 Usage: python isbn_sync.py
 """
 import os
@@ -21,14 +21,40 @@ FEISHU_APP_ID           = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET       = os.getenv("FEISHU_APP_SECRET", "")
 SPREADSHEET_TOKEN       = os.getenv("FEISHU_SPREADSHEET_TOKEN", "")
 SHEET_ID                = os.getenv("FEISHU_SHEET_ID", "")
-INPUT_SPREADSHEET_TOKEN = os.getenv("FEISHU_INPUT_SPREADSHEET_TOKEN", "")
-INPUT_SHEET_ID          = os.getenv("FEISHU_INPUT_SHEET_ID", "")
 FEISHU_BASE             = "https://open.feishu.cn/open-apis"
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
 
 _raw_keys = os.getenv("GOOGLE_API_KEYS", ",")
 API_KEYS = [k.strip() for k in _raw_keys.split(",")]
+
+# =============================================
+# Input sources — each has its own (name, spreadsheet_token, sheet_id)
+# Add new sources here, or load from .env (see INPUT_SOURCES_JSON below).
+# =============================================
+DEFAULT_INPUT_SOURCES = [
+    {
+        "name": "main",
+        "spreadsheet_token": os.getenv("FEISHU_INPUT_SPREADSHEET_TOKEN", "UAROsHnTMhnsYetPGu5cwg8on5g"),
+        "sheet_id": os.getenv("FEISHU_INPUT_SHEET_ID", "caa5d1"),
+    },
+    {
+        "name": "source2",
+        "spreadsheet_token": "JtFXsgzyahRVyNtfwc3cehPqn9c",
+        "sheet_id": "fefb70",
+    },
+]
+
+# Optional: override/extend sources via .env as JSON, e.g.
+# INPUT_SOURCES_JSON=[{"name":"main","spreadsheet_token":"...","sheet_id":"..."}, ...]
+_input_sources_json = os.getenv("INPUT_SOURCES_JSON", "")
+if _input_sources_json:
+    try:
+        INPUT_SOURCES = json.loads(_input_sources_json)
+    except Exception:
+        INPUT_SOURCES = DEFAULT_INPUT_SOURCES
+else:
+    INPUT_SOURCES = DEFAULT_INPUT_SOURCES
 
 # =============================================
 # Logging
@@ -81,17 +107,17 @@ def clean_isbn(raw) -> str:
         return "".join(c for c in s if c.isdigit())
 
 # =============================================
-# Feishu Read / Write
+# Feishu Read / Write (now parameterized by source)
 # =============================================
-def read_input_sheet() -> list[dict]:
+def read_input_sheet(spreadsheet_token: str, sheet_id: str) -> list[dict]:
     r = requests.get(
-        f"{FEISHU_BASE}/sheets/v2/spreadsheets/{INPUT_SPREADSHEET_TOKEN}/values/{INPUT_SHEET_ID}!A1:E5000",
+        f"{FEISHU_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{sheet_id}!A1:E5000",
         headers=headers(),
         timeout=15,
     )
     payload = r.json()
     if payload.get("code", 0) != 0:
-        raise RuntimeError(f"Failed to read sheet: {payload}")
+        raise RuntimeError(f"Failed to read sheet ({spreadsheet_token}/{sheet_id}): {payload}")
 
     rows = payload.get("data", {}).get("valueRange", {}).get("values", [])
     if not rows or len(rows) < 2:
@@ -110,25 +136,25 @@ def read_input_sheet() -> list[dict]:
     return records
 
 
-def write_back(row_num: int, title: str, author: str, binding: str, condition: str):
+def write_back(spreadsheet_token: str, sheet_id: str, row_num: int, title: str, author: str, binding: str, condition: str):
     """Write back B:E — Title / Author / Binding / Condition (match sheet only)"""
     payload = {"valueRange": {
-        "range": f"{INPUT_SHEET_ID}!B{row_num}:E{row_num}",
+        "range": f"{sheet_id}!B{row_num}:E{row_num}",
         "values": [[title, author, binding, condition]],
     }}
     r = requests.put(
-        f"{FEISHU_BASE}/sheets/v2/spreadsheets/{INPUT_SPREADSHEET_TOKEN}/values",
+        f"{FEISHU_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values",
         headers=headers(),
         data=json.dumps(payload),
         timeout=10,
     )
     result = r.json()
     if result.get("code", 0) != 0:
-        raise RuntimeError(f"Write failed at row {row_num}: {result}")
+        raise RuntimeError(f"Write failed at row {row_num} ({spreadsheet_token}/{sheet_id}): {result}")
 
 
 def save_to_db(isbn, title, author, binding, date, lang, pages, condition):
-    """Save full record to DB cache sheet (A:H)"""
+    """Save full record to shared DB cache sheet (A:H)"""
     try:
         r = requests.get(
             f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{SHEET_ID}!A1:A5000",
@@ -319,36 +345,52 @@ def resolve(isbn: str) -> tuple[str, str, str, str, str, str, str]:
     return title, author, binding, date, lang, pages, condition
 
 # =============================================
-# Main Loop
+# Main Loop — now iterates over all input sources
 # =============================================
-def sync_once():
-    rows = read_input_sheet()
+def sync_source(source: dict) -> int:
+    """Process one input source. Returns number of rows written."""
+    name = source["name"]
+    sp_token = source["spreadsheet_token"]
+    sh_id = source["sheet_id"]
+
+    rows = read_input_sheet(sp_token, sh_id)
     pending = [r for r in rows if not r.get("title", "").strip()]
 
     if not pending:
         return 0
 
-    log.info(f"Found {len(pending)} ISBN(s) to look up")
+    log.info(f"[{name}] Found {len(pending)} ISBN(s) to look up")
     count = 0
     for r in pending:
         isbn    = r["isbn"]
         row_num = r["_row"]
         try:
             title, author, binding, date, lang, pages, condition = resolve(isbn)
-            write_back(row_num, title, author, binding, condition)  # date/lang/pages go to DB only
-            log.info(f"  ✅ Row {row_num} | {isbn} → {title} / {author} [{binding}] {date} ({condition})")
+            write_back(sp_token, sh_id, row_num, title, author, binding, condition)
+            log.info(f"  ✅ [{name}] Row {row_num} | {isbn} → {title} / {author} [{binding}] {date} ({condition})")
             count += 1
             time.sleep(0.5)
         except Exception as e:
-            log.error(f"  ❌ Row {row_num} | {isbn} → Error: {e}")
+            log.error(f"  ❌ [{name}] Row {row_num} | {isbn} → Error: {e}")
 
     return count
+
+
+def sync_once() -> int:
+    total = 0
+    for source in INPUT_SOURCES:
+        try:
+            total += sync_source(source)
+        except Exception as e:
+            log.error(f"[{source.get('name')}] sync_source error: {e}")
+    return total
 
 
 def main():
     log.info("=" * 50)
     log.info("ISBN Sync daemon started")
     log.info(f"Poll interval: {POLL_INTERVAL}s")
+    log.info(f"Input sources: {[s['name'] for s in INPUT_SOURCES]}")
     log.info("=" * 50)
 
     while True:
