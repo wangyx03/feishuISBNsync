@@ -8,12 +8,16 @@ Each input source runs its own independent polling loop in its own thread,
 so a slow source (many pending ISBNs) never blocks another source (few
 pending ISBNs) from picking up new rows.
 
-Additionally, ISBN resolution is protected by a per-ISBN lock + in-process
-cache: if two source threads try to resolve the SAME ISBN at nearly the
-same time, only one of them actually calls the Google/OpenLibrary APIs and
-writes to the DB cache — the other waits and reuses that result. This
-avoids duplicate rows in the DB cache sheet that can happen from relying
-on Feishu read-after-write consistency.
+ISBN resolution is protected by a per-ISBN lock + in-process cache: if two
+source threads try to resolve the SAME ISBN at nearly the same time, only
+one of them actually calls the Google/OpenLibrary APIs and writes to the
+DB cache — the other waits and reuses that result.
+
+Feishu access tokens are refreshed proactively on a timer, AND reactively
+whenever Feishu reports the token as invalid/expired (error code 99991663)
+— this handles cases where Feishu invalidates a token sooner than our
+local timer expects. All Feishu-calling functions retry once after a
+forced token refresh before giving up.
 
 Usage: python isbn_sync.py
 """
@@ -37,6 +41,9 @@ SHEET_ID                = os.getenv("FEISHU_SHEET_ID", "")
 FEISHU_BASE             = "https://open.feishu.cn/open-apis"
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
+
+# Feishu error code for "invalid/expired access token"
+FEISHU_INVALID_TOKEN_CODE = 99991663
 
 _raw_keys = os.getenv("GOOGLE_API_KEYS", ",")
 API_KEYS = [k.strip() for k in _raw_keys.split(",")]
@@ -84,18 +91,25 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # =============================================
-# Feishu Token (refresh every 110 minutes) — thread-safe
+# Feishu Token (refresh every 110 minutes, or immediately on demand)
+# Thread-safe.
 # =============================================
 _token_cache = {"token": None, "expires_at": 0}
 _token_lock = threading.Lock()
 
-def get_token() -> str:
-    # fast path without lock
-    if time.time() < _token_cache["expires_at"]:
+def get_token(force_refresh: bool = False) -> str:
+    """
+    Returns a valid Feishu tenant_access_token.
+    - Normally returns the cached token if it hasn't hit our local expiry timer.
+    - If force_refresh=True, ALWAYS fetches a fresh token regardless of the
+      timer — used when Feishu itself reports the cached token as invalid,
+      since Feishu's real expiry can occur sooner than our local estimate.
+    """
+    if not force_refresh and time.time() < _token_cache["expires_at"]:
         return _token_cache["token"]
     with _token_lock:
         # re-check inside lock in case another thread already refreshed it
-        if time.time() < _token_cache["expires_at"]:
+        if not force_refresh and time.time() < _token_cache["expires_at"]:
             return _token_cache["token"]
         r = requests.post(
             f"{FEISHU_BASE}/auth/v3/tenant_access_token/internal/",
@@ -107,11 +121,20 @@ def get_token() -> str:
             raise RuntimeError(f"Feishu token fetch failed: {data}")
         _token_cache["token"] = data["tenant_access_token"]
         _token_cache["expires_at"] = time.time() + 6600
-        log.info("Feishu token refreshed")
+        log.info(f"Feishu token refreshed{' (forced — previous token was rejected)' if force_refresh else ''}")
         return _token_cache["token"]
 
-def headers():
-    return {"Authorization": f"Bearer {get_token()}", "Content-Type": "application/json"}
+def invalidate_token():
+    """Force the next get_token() call to fetch a brand new token."""
+    with _token_lock:
+        _token_cache["expires_at"] = 0
+
+def headers(force_refresh: bool = False):
+    return {"Authorization": f"Bearer {get_token(force_refresh)}", "Content-Type": "application/json"}
+
+
+def _is_invalid_token_response(payload: dict) -> bool:
+    return isinstance(payload, dict) and payload.get("code") == FEISHU_INVALID_TOKEN_CODE
 
 # =============================================
 # ISBN Cleaning
@@ -127,14 +150,24 @@ def clean_isbn(raw) -> str:
 
 # =============================================
 # Feishu Read / Write (parameterized by source)
+# Each function retries ONCE with a forcibly-refreshed token if Feishu
+# reports the token as invalid/expired.
 # =============================================
 def read_input_sheet(spreadsheet_token: str, sheet_id: str) -> list[dict]:
-    r = requests.get(
-        f"{FEISHU_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{sheet_id}!A1:E5000",
-        headers=headers(),
-        timeout=15,
-    )
-    payload = r.json()
+    def _do(force_refresh: bool):
+        r = requests.get(
+            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{sheet_id}!A1:E5000",
+            headers=headers(force_refresh),
+            timeout=15,
+        )
+        return r.json()
+
+    payload = _do(False)
+    if _is_invalid_token_response(payload):
+        log.warning(f"Access token rejected reading ({spreadsheet_token}/{sheet_id}); forcing refresh and retrying")
+        invalidate_token()
+        payload = _do(True)
+
     if payload.get("code", 0) != 0:
         raise RuntimeError(f"Failed to read sheet ({spreadsheet_token}/{sheet_id}): {payload}")
 
@@ -157,17 +190,26 @@ def read_input_sheet(spreadsheet_token: str, sheet_id: str) -> list[dict]:
 
 def write_back(spreadsheet_token: str, sheet_id: str, row_num: int, title: str, author: str, binding: str, condition: str):
     """Write back B:E — Title / Author / Binding / Condition (match sheet only)"""
-    payload = {"valueRange": {
+    payload_body = {"valueRange": {
         "range": f"{sheet_id}!B{row_num}:E{row_num}",
         "values": [[title, author, binding, condition]],
     }}
-    r = requests.put(
-        f"{FEISHU_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values",
-        headers=headers(),
-        data=json.dumps(payload),
-        timeout=10,
-    )
-    result = r.json()
+
+    def _do(force_refresh: bool):
+        r = requests.put(
+            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values",
+            headers=headers(force_refresh),
+            data=json.dumps(payload_body),
+            timeout=10,
+        )
+        return r.json()
+
+    result = _do(False)
+    if _is_invalid_token_response(result):
+        log.warning(f"Access token rejected writing row {row_num} ({spreadsheet_token}/{sheet_id}); forcing refresh and retrying")
+        invalidate_token()
+        result = _do(True)
+
     if result.get("code", 0) != 0:
         raise RuntimeError(f"Write failed at row {row_num} ({spreadsheet_token}/{sheet_id}): {result}")
 
@@ -182,23 +224,38 @@ def save_to_db(isbn, title, author, binding, date, lang, pages, condition):
     """Save full record to shared DB cache sheet (A:H)"""
     try:
         with _db_lock:
-            r = requests.get(
-                f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{SHEET_ID}!A1:A5000",
-                headers=headers(), timeout=10,
-            )
-            rows = r.json().get("data", {}).get("valueRange", {}).get("values", [])
+            def _do_read(force_refresh: bool):
+                r = requests.get(
+                    f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{SHEET_ID}!A1:A5000",
+                    headers=headers(force_refresh), timeout=10,
+                )
+                return r.json()
+
+            payload = _do_read(False)
+            if _is_invalid_token_response(payload):
+                invalidate_token()
+                payload = _do_read(True)
+
+            rows = payload.get("data", {}).get("valueRange", {}).get("values", [])
             existing_isbns = [clean_isbn(row[0]) for row in rows[1:] if row]
 
             if isbn not in existing_isbns:
-                requests.post(
-                    f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values_append",
-                    headers=headers(),
-                    data=json.dumps({"valueRange": {
-                        "range": f"{SHEET_ID}!A1:H1",
-                        "values": [[isbn, title, author, binding, date, lang, pages, condition]],
-                    }}),
-                    timeout=10,
-                )
+                def _do_append(force_refresh: bool):
+                    r = requests.post(
+                        f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values_append",
+                        headers=headers(force_refresh),
+                        data=json.dumps({"valueRange": {
+                            "range": f"{SHEET_ID}!A1:H1",
+                            "values": [[isbn, title, author, binding, date, lang, pages, condition]],
+                        }}),
+                        timeout=10,
+                    )
+                    return r.json()
+
+                append_result = _do_append(False)
+                if _is_invalid_token_response(append_result):
+                    invalidate_token()
+                    _do_append(True)
     except Exception as e:
         log.warning(f"DB cache write failed (non-critical): {e}")
 
@@ -206,11 +263,19 @@ def save_to_db(isbn, title, author, binding, date, lang, pages, condition):
 def lookup_db_cache(isbn: str):
     """Returns (title, author, binding, date, lang, pages, condition) or all None"""
     try:
-        r = requests.get(
-            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{SHEET_ID}!A1:H5000",
-            headers=headers(), timeout=10,
-        )
-        rows = r.json().get("data", {}).get("valueRange", {}).get("values", [])
+        def _do(force_refresh: bool):
+            r = requests.get(
+                f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{SHEET_ID}!A1:H5000",
+                headers=headers(force_refresh), timeout=10,
+            )
+            return r.json()
+
+        payload = _do(False)
+        if _is_invalid_token_response(payload):
+            invalidate_token()
+            payload = _do(True)
+
+        rows = payload.get("data", {}).get("valueRange", {}).get("values", [])
         for row in rows[1:]:
             if row and clean_isbn(row[0]) == isbn:
                 def _get(i): return "" if len(row) <= i or row[i] is None else str(row[i])
@@ -338,7 +403,7 @@ def lookup_openlibrary(isbn: str):
     return None, None, None, None, None, None
 
 # =============================================
-# Per-ISBN lock + in-process memory cache
+# Resolve (merge both sources), thread-safe via per-ISBN lock + memory cache
 #
 # If two source threads try to resolve the SAME isbn at nearly the same
 # time, without this only one of them would win the DB-cache dedup check
@@ -346,6 +411,13 @@ def lookup_openlibrary(isbn: str):
 # so both could end up thinking "not in DB yet" and both write. This lock
 # makes resolution of any single ISBN strictly one-at-a-time, in-process,
 # regardless of Feishu's consistency behavior.
+#
+# IMPORTANT: when a second thread reuses a cached result, the returned
+# "condition" (e.g. "Google + OL") is whatever the FIRST thread computed.
+# It is intentionally NOT rewritten to "DB" — "DB" is reserved for rows
+# actually found in the persisted Feishu DB-cache sheet. Watch for the
+# "⚡ reused..." log lines to know when a cache-hit happened vs a fresh
+# lookup, since the printed condition alone can't tell you that.
 # =============================================
 _isbn_locks: dict[str, threading.Lock] = {}
 _isbn_locks_guard = threading.Lock()
@@ -373,6 +445,7 @@ def resolve(isbn: str) -> tuple[str, str, str, str, str, str, str]:
     with _memory_cache_lock:
         cached = _memory_cache.get(isbn)
     if cached:
+        log.info(f"  ⚡ {isbn} → reused in-process cache (no duplicate API call)")
         return cached
 
     isbn_lock = _get_isbn_lock(isbn)
@@ -382,6 +455,7 @@ def resolve(isbn: str) -> tuple[str, str, str, str, str, str, str]:
         with _memory_cache_lock:
             cached = _memory_cache.get(isbn)
         if cached:
+            log.info(f"  ⚡ {isbn} → reused result from concurrent lookup (waited on lock)")
             return cached
 
         result = _resolve_uncached(isbn)
