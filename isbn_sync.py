@@ -3,12 +3,25 @@ isbn_sync.py — Auto-sync daemon
 Continuously monitors multiple Feishu ISBN_match sheets (input sources).
 When a new ISBN is found with no Title, it looks it up and writes back Title/Author/Binding/Condition.
 Date/Language/Pages are stored in the shared DB cache only.
+
+Each input source runs its own independent polling loop in its own thread,
+so a slow source (many pending ISBNs) never blocks another source (few
+pending ISBNs) from picking up new rows.
+
+Additionally, ISBN resolution is protected by a per-ISBN lock + in-process
+cache: if two source threads try to resolve the SAME ISBN at nearly the
+same time, only one of them actually calls the Google/OpenLibrary APIs and
+writes to the DB cache — the other waits and reuses that result. This
+avoids duplicate rows in the DB cache sheet that can happen from relying
+on Feishu read-after-write consistency.
+
 Usage: python isbn_sync.py
 """
 import os
 import json
 import time
 import logging
+import threading
 import requests
 from dotenv import load_dotenv
 
@@ -71,25 +84,31 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # =============================================
-# Feishu Token (refresh every 110 minutes)
+# Feishu Token (refresh every 110 minutes) — thread-safe
 # =============================================
 _token_cache = {"token": None, "expires_at": 0}
+_token_lock = threading.Lock()
 
 def get_token() -> str:
+    # fast path without lock
     if time.time() < _token_cache["expires_at"]:
         return _token_cache["token"]
-    r = requests.post(
-        f"{FEISHU_BASE}/auth/v3/tenant_access_token/internal/",
-        data={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
-        timeout=10,
-    )
-    data = r.json()
-    if data.get("code") != 0:
-        raise RuntimeError(f"Feishu token fetch failed: {data}")
-    _token_cache["token"] = data["tenant_access_token"]
-    _token_cache["expires_at"] = time.time() + 6600
-    log.info("Feishu token refreshed")
-    return _token_cache["token"]
+    with _token_lock:
+        # re-check inside lock in case another thread already refreshed it
+        if time.time() < _token_cache["expires_at"]:
+            return _token_cache["token"]
+        r = requests.post(
+            f"{FEISHU_BASE}/auth/v3/tenant_access_token/internal/",
+            data={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
+            timeout=10,
+        )
+        data = r.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"Feishu token fetch failed: {data}")
+        _token_cache["token"] = data["tenant_access_token"]
+        _token_cache["expires_at"] = time.time() + 6600
+        log.info("Feishu token refreshed")
+        return _token_cache["token"]
 
 def headers():
     return {"Authorization": f"Bearer {get_token()}", "Content-Type": "application/json"}
@@ -107,7 +126,7 @@ def clean_isbn(raw) -> str:
         return "".join(c for c in s if c.isdigit())
 
 # =============================================
-# Feishu Read / Write (now parameterized by source)
+# Feishu Read / Write (parameterized by source)
 # =============================================
 def read_input_sheet(spreadsheet_token: str, sheet_id: str) -> list[dict]:
     r = requests.get(
@@ -153,26 +172,33 @@ def write_back(spreadsheet_token: str, sheet_id: str, row_num: int, title: str, 
         raise RuntimeError(f"Write failed at row {row_num} ({spreadsheet_token}/{sheet_id}): {result}")
 
 
+# --- DB cache access is shared across all source threads. Guard with a lock
+#     so that even outside of the per-ISBN lock (belt-and-suspenders), two
+#     writes can't interleave inside the read-then-append sequence.
+_db_lock = threading.Lock()
+
+
 def save_to_db(isbn, title, author, binding, date, lang, pages, condition):
     """Save full record to shared DB cache sheet (A:H)"""
     try:
-        r = requests.get(
-            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{SHEET_ID}!A1:A5000",
-            headers=headers(), timeout=10,
-        )
-        rows = r.json().get("data", {}).get("valueRange", {}).get("values", [])
-        existing_isbns = [clean_isbn(row[0]) for row in rows[1:] if row]
-
-        if isbn not in existing_isbns:
-            requests.post(
-                f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values_append",
-                headers=headers(),
-                data=json.dumps({"valueRange": {
-                    "range": f"{SHEET_ID}!A1:H1",
-                    "values": [[isbn, title, author, binding, date, lang, pages, condition]],
-                }}),
-                timeout=10,
+        with _db_lock:
+            r = requests.get(
+                f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values/{SHEET_ID}!A1:A5000",
+                headers=headers(), timeout=10,
             )
+            rows = r.json().get("data", {}).get("valueRange", {}).get("values", [])
+            existing_isbns = [clean_isbn(row[0]) for row in rows[1:] if row]
+
+            if isbn not in existing_isbns:
+                requests.post(
+                    f"{FEISHU_BASE}/sheets/v2/spreadsheets/{SPREADSHEET_TOKEN}/values_append",
+                    headers=headers(),
+                    data=json.dumps({"valueRange": {
+                        "range": f"{SHEET_ID}!A1:H1",
+                        "values": [[isbn, title, author, binding, date, lang, pages, condition]],
+                    }}),
+                    timeout=10,
+                )
     except Exception as e:
         log.warning(f"DB cache write failed (non-critical): {e}")
 
@@ -312,10 +338,65 @@ def lookup_openlibrary(isbn: str):
     return None, None, None, None, None, None
 
 # =============================================
-# Resolve (merge both sources)
+# Per-ISBN lock + in-process memory cache
+#
+# If two source threads try to resolve the SAME isbn at nearly the same
+# time, without this only one of them would win the DB-cache dedup check
+# by a hair — but timing with Feishu's read-after-write isn't guaranteed,
+# so both could end up thinking "not in DB yet" and both write. This lock
+# makes resolution of any single ISBN strictly one-at-a-time, in-process,
+# regardless of Feishu's consistency behavior.
 # =============================================
+_isbn_locks: dict[str, threading.Lock] = {}
+_isbn_locks_guard = threading.Lock()
+
+_memory_cache: dict[str, tuple] = {}
+_memory_cache_lock = threading.Lock()
+
+
+def _get_isbn_lock(isbn: str) -> threading.Lock:
+    with _isbn_locks_guard:
+        lock = _isbn_locks.get(isbn)
+        if lock is None:
+            lock = threading.Lock()
+            _isbn_locks[isbn] = lock
+        return lock
+
+
 def resolve(isbn: str) -> tuple[str, str, str, str, str, str, str]:
-    """Returns (title, author, binding, date, lang, pages, condition)"""
+    """
+    Thread-safe wrapper: ensures only one thread ever actually performs
+    the lookup + save_to_db for a given isbn during this process's lifetime.
+    Other threads asking for the same isbn will block briefly and then
+    reuse the already-computed result.
+    """
+    with _memory_cache_lock:
+        cached = _memory_cache.get(isbn)
+    if cached:
+        return cached
+
+    isbn_lock = _get_isbn_lock(isbn)
+    with isbn_lock:
+        # Another thread may have finished resolving this isbn while we
+        # were waiting for the lock — check again before doing any work.
+        with _memory_cache_lock:
+            cached = _memory_cache.get(isbn)
+        if cached:
+            return cached
+
+        result = _resolve_uncached(isbn)
+
+        with _memory_cache_lock:
+            _memory_cache[isbn] = result
+        return result
+
+
+def _resolve_uncached(isbn: str) -> tuple[str, str, str, str, str, str, str]:
+    """
+    Actual resolve logic (DB cache -> Google/OpenLibrary -> merge -> save).
+    Only ever called while holding that isbn's lock, so it's safe even
+    though it isn't itself thread-safe.
+    """
     t, a, b, d, l, p, c = lookup_db_cache(isbn)
     if t:
         return t, a, b, d, l, p, "DB"
@@ -345,7 +426,7 @@ def resolve(isbn: str) -> tuple[str, str, str, str, str, str, str]:
     return title, author, binding, date, lang, pages, condition
 
 # =============================================
-# Main Loop — now iterates over all input sources
+# Per-source sync (one pass over one source's pending rows)
 # =============================================
 def sync_source(source: dict) -> int:
     """Process one input source. Returns number of rows written."""
@@ -375,35 +456,56 @@ def sync_source(source: dict) -> int:
 
     return count
 
-
-def sync_once() -> int:
-    total = 0
-    for source in INPUT_SOURCES:
+# =============================================
+# Independent per-source worker loop
+# =============================================
+def source_worker(source: dict):
+    """
+    Runs forever in its own thread, polling ONLY this source.
+    Never waits on any other source — a source with a long backlog
+    just keeps looping on its own cadence without blocking others.
+    """
+    name = source["name"]
+    log.info(f"[{name}] worker started")
+    while True:
         try:
-            total += sync_source(source)
+            count = sync_source(source)
+            if count:
+                log.info(f"[{name}] Done — {count} row(s) written. Next check in {POLL_INTERVAL}s")
+            else:
+                log.debug(f"[{name}] Nothing to do. Next check in {POLL_INTERVAL}s")
         except Exception as e:
-            log.error(f"[{source.get('name')}] sync_source error: {e}")
-    return total
+            log.error(f"[{name}] sync_source error: {e}")
+        time.sleep(POLL_INTERVAL)
 
-
+# =============================================
+# Main — spins up one worker thread per source, then just watches them
+# =============================================
 def main():
     log.info("=" * 50)
     log.info("ISBN Sync daemon started")
     log.info(f"Poll interval: {POLL_INTERVAL}s")
-    log.info(f"Input sources: {[s['name'] for s in INPUT_SOURCES]}")
+    log.info(f"Input sources: {[s['name'] for s in INPUT_SOURCES]} (independent per-source workers)")
     log.info("=" * 50)
 
-    while True:
-        try:
-            count = sync_once()
-            if count:
-                log.info(f"Done — {count} row(s) written. Next check in {POLL_INTERVAL}s")
-            else:
-                log.debug(f"Nothing to do. Next check in {POLL_INTERVAL}s")
-        except Exception as e:
-            log.error(f"sync_once error: {e}")
+    threads = {}
+    for source in INPUT_SOURCES:
+        t = threading.Thread(target=source_worker, args=(source,), daemon=True, name=source["name"])
+        t.start()
+        threads[source["name"]] = (t, source)
 
-        time.sleep(POLL_INTERVAL)
+    # Main thread just supervises: if a worker thread dies unexpectedly
+    # (shouldn't normally happen since sync_source errors are caught
+    # inside the loop), restart it rather than silently losing that
+    # source's polling forever.
+    while True:
+        time.sleep(30)
+        for name, (t, source) in list(threads.items()):
+            if not t.is_alive():
+                log.error(f"[{name}] worker thread died — restarting")
+                new_t = threading.Thread(target=source_worker, args=(source,), daemon=True, name=name)
+                new_t.start()
+                threads[name] = (new_t, source)
 
 
 if __name__ == "__main__":
