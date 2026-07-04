@@ -67,7 +67,7 @@ API_KEYS = [k.strip() for k in _raw_keys.split(",")]
 # system timezone (which is UTC) — DST is handled automatically.
 # =============================================
 LOCAL_TZ = ZoneInfo("America/Detroit")
-CACHE_RESET_TIMES = [(0, 0), (6, 0)]  # (hour, minute) pairs, 24h clock, local time
+CACHE_RESET_TIMES = [(0, 0)]  # (hour, minute) pairs, 24h clock, local time
 
 # =============================================
 # Input sources — each has its own (name, spreadsheet_token, sheet_id)
@@ -632,8 +632,15 @@ def main():
     if hasattr(signal, "SIGUSR1"):
         signal.signal(signal.SIGUSR1, _handle_manual_reset_signal)
         log.info("Manual cache reset: kill -USR1 <pid>, or `systemctl kill -s SIGUSR1 isbn_sync`")
+    elif hasattr(signal, "SIGBREAK"):
+        # Windows has no SIGUSR1. SIGBREAK (triggered by Ctrl+Break in the
+        # terminal — NOT Ctrl+C, which would kill the process) is used here
+        # purely so the manual-reset feature can be tested locally. The
+        # real deployment on the Linux VPS uses SIGUSR1 above.
+        signal.signal(signal.SIGBREAK, _handle_manual_reset_signal)
+        log.info("Manual cache reset (local Windows testing): press Ctrl+Break in this terminal")
     else:
-        log.info("Manual cache reset via SIGUSR1 is unavailable on this platform (Windows) — skipped")
+        log.info("Manual cache reset signal is unavailable on this platform — skipped")
     log.info("=" * 50)
 
     threads = {}
