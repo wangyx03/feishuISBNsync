@@ -13,6 +13,13 @@ source threads try to resolve the SAME ISBN at nearly the same time, only
 one of them actually calls the Google/OpenLibrary APIs and writes to the
 DB cache — the other waits and reuses that result.
 
+The in-process cache is intentionally NOT a rolling TTL per ISBN. Instead,
+the whole cache is wiped clean at fixed local times each day (see
+CACHE_RESET_TIMES below), so that manual edits to the shared Feishu DB
+cache sheet are guaranteed to be picked up again within a bounded window,
+while still avoiding duplicate API calls for the same ISBN within a short
+span of time.
+
 Feishu access tokens are refreshed proactively on a timer, AND reactively
 whenever Feishu reports the token as invalid/expired (error code 99991663)
 — this handles cases where Feishu invalidates a token sooner than our
@@ -26,6 +33,9 @@ import json
 import time
 import logging
 import threading
+import datetime
+import signal
+from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 
@@ -47,6 +57,17 @@ FEISHU_INVALID_TOKEN_CODE = 99991663
 
 _raw_keys = os.getenv("GOOGLE_API_KEYS", ",")
 API_KEYS = [k.strip() for k in _raw_keys.split(",")]
+
+# =============================================
+# In-process resolve() cache reset schedule
+# The whole _memory_cache dict is cleared at these local times every day
+# (24h clock), so manual edits to the DB cache sheet are re-read within
+# a bounded window instead of being masked forever by a stale in-memory
+# result. Timezone is explicit so this doesn't depend on the server's
+# system timezone (which is UTC) — DST is handled automatically.
+# =============================================
+LOCAL_TZ = ZoneInfo("America/Detroit")
+CACHE_RESET_TIMES = [(0, 0), (6, 0)]  # (hour, minute) pairs, 24h clock, local time
 
 # =============================================
 # Input sources — each has its own (name, spreadsheet_token, sheet_id)
@@ -412,6 +433,15 @@ def lookup_openlibrary(isbn: str):
 # makes resolution of any single ISBN strictly one-at-a-time, in-process,
 # regardless of Feishu's consistency behavior.
 #
+# The in-process cache (_memory_cache) is a plain dict with NO per-entry
+# TTL. Instead, cache_reset_worker() wipes the whole dict clean at fixed
+# times every day (see CACHE_RESET_TIMES), so:
+#   - within a day, repeated lookups of the same ISBN never hit the API
+#     or even the DB cache sheet again (fast, cheap)
+#   - manual edits to the DB cache sheet are guaranteed to be picked up
+#     again after the next scheduled reset, instead of being masked
+#     forever by a stale in-memory result
+#
 # IMPORTANT: when a second thread reuses a cached result, the returned
 # "condition" (e.g. "Google + OL") is whatever the FIRST thread computed.
 # It is intentionally NOT rewritten to "DB" — "DB" is reserved for rows
@@ -438,9 +468,9 @@ def _get_isbn_lock(isbn: str) -> threading.Lock:
 def resolve(isbn: str) -> tuple[str, str, str, str, str, str, str]:
     """
     Thread-safe wrapper: ensures only one thread ever actually performs
-    the lookup + save_to_db for a given isbn during this process's lifetime.
-    Other threads asking for the same isbn will block briefly and then
-    reuse the already-computed result.
+    the lookup + save_to_db for a given isbn between scheduled cache
+    resets. Other threads asking for the same isbn will block briefly
+    and then reuse the already-computed result.
     """
     with _memory_cache_lock:
         cached = _memory_cache.get(isbn)
@@ -500,6 +530,43 @@ def _resolve_uncached(isbn: str) -> tuple[str, str, str, str, str, str, str]:
     return title, author, binding, date, lang, pages, condition
 
 # =============================================
+# Daily cache reset worker
+# Wipes the entire in-process _memory_cache at fixed local times each day
+# (America/Detroit, DST-aware), so resolve() re-reads the DB cache sheet
+# (and re-hits the APIs if still not found there) after each reset,
+# picking up any manual edits made to the DB sheet in the meantime.
+# =============================================
+def _next_reset_time(now: datetime.datetime) -> datetime.datetime:
+    candidates = []
+    for h, m in CACHE_RESET_TIMES:
+        candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += datetime.timedelta(days=1)
+        candidates.append(candidate)
+    return min(candidates)
+
+
+def _clear_memory_cache(reason: str):
+    with _memory_cache_lock:
+        count = len(_memory_cache)
+        _memory_cache.clear()
+    log.info(f"[cache] Reset ({reason}) — cleared {count} cached ISBN(s), will re-read from DB sheet as needed")
+
+
+def _handle_manual_reset_signal(signum, frame):
+    _clear_memory_cache("manual — SIGUSR1 received")
+
+
+def cache_reset_worker():
+    while True:
+        now = datetime.datetime.now(LOCAL_TZ)
+        next_reset = _next_reset_time(now)
+        sleep_seconds = (next_reset - now).total_seconds()
+        log.info(f"[cache] Next in-process cache reset at {next_reset.strftime('%Y-%m-%d %H:%M:%S %Z')} (in {sleep_seconds/3600:.1f}h)")
+        time.sleep(sleep_seconds)
+        _clear_memory_cache("scheduled")
+
+# =============================================
 # Per-source sync (one pass over one source's pending rows)
 # =============================================
 def sync_source(source: dict) -> int:
@@ -553,13 +620,20 @@ def source_worker(source: dict):
         time.sleep(POLL_INTERVAL)
 
 # =============================================
-# Main — spins up one worker thread per source, then just watches them
+# Main — spins up one worker thread per source, plus the cache reset
+# worker, then just watches them.
 # =============================================
 def main():
     log.info("=" * 50)
     log.info("ISBN Sync daemon started")
     log.info(f"Poll interval: {POLL_INTERVAL}s")
     log.info(f"Input sources: {[s['name'] for s in INPUT_SOURCES]} (independent per-source workers)")
+    log.info(f"In-process cache reset times: {CACHE_RESET_TIMES} ({LOCAL_TZ})")
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, _handle_manual_reset_signal)
+        log.info("Manual cache reset: kill -USR1 <pid>, or `systemctl kill -s SIGUSR1 isbn_sync`")
+    else:
+        log.info("Manual cache reset via SIGUSR1 is unavailable on this platform (Windows) — skipped")
     log.info("=" * 50)
 
     threads = {}
@@ -567,6 +641,10 @@ def main():
         t = threading.Thread(target=source_worker, args=(source,), daemon=True, name=source["name"])
         t.start()
         threads[source["name"]] = (t, source)
+
+    cache_thread = threading.Thread(target=cache_reset_worker, daemon=True, name="cache_reset")
+    cache_thread.start()
+    threads["cache_reset"] = (cache_thread, None)
 
     # Main thread just supervises: if a worker thread dies unexpectedly
     # (shouldn't normally happen since sync_source errors are caught
@@ -577,7 +655,10 @@ def main():
         for name, (t, source) in list(threads.items()):
             if not t.is_alive():
                 log.error(f"[{name}] worker thread died — restarting")
-                new_t = threading.Thread(target=source_worker, args=(source,), daemon=True, name=name)
+                if name == "cache_reset":
+                    new_t = threading.Thread(target=cache_reset_worker, daemon=True, name=name)
+                else:
+                    new_t = threading.Thread(target=source_worker, args=(source,), daemon=True, name=name)
                 new_t.start()
                 threads[name] = (new_t, source)
 
