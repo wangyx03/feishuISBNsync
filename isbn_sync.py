@@ -26,6 +26,14 @@ whenever Feishu reports the token as invalid/expired (error code 99991663)
 local timer expects. All Feishu-calling functions retry once after a
 forced token refresh before giving up.
 
+Additionally, a low-frequency "stats" worker periodically reads the ISBN
+column from EVERY input source independently (not just pending rows),
+counts how many times each ISBN appears per source, and writes a summary
+table (ISBN | Title | Author | <source1> | <source2> | ... | Total) to a
+separate output sheet. This runs on its own, much slower interval so it
+never competes with the real-time resolution workers for API/rate-limit
+budget.
+
 Usage: python isbn_sync.py
 """
 import os
@@ -35,6 +43,7 @@ import logging
 import threading
 import datetime
 import signal
+from collections import Counter
 from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
@@ -51,6 +60,11 @@ SHEET_ID                = os.getenv("FEISHU_SHEET_ID", "")
 FEISHU_BASE             = "https://open.feishu.cn/open-apis"
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
+
+# --- Frequency stats worker config ---
+STATS_INTERVAL          = int(os.getenv("STATS_INTERVAL", "300"))  # seconds; slow on purpose
+STATS_OUTPUT_TOKEN      = os.getenv("STATS_OUTPUT_SPREADSHEET_TOKEN", "")
+STATS_OUTPUT_SHEET_ID   = os.getenv("STATS_OUTPUT_SHEET_ID", "")
 
 # Feishu error code for "invalid/expired access token"
 FEISHU_INVALID_TOKEN_CODE = 99991663
@@ -620,8 +634,126 @@ def source_worker(source: dict):
         time.sleep(POLL_INTERVAL)
 
 # =============================================
+# Frequency stats worker
+#
+# Independently of the resolve/write-back workers above, this worker
+# periodically re-reads the ISBN column from EVERY input source (the
+# full sheet, not just pending rows), counts how many times each ISBN
+# appears per source, and writes a summary table to a separate output
+# sheet:
+#
+#   ISBN | Title | Author | <source1 name> | <source2 name> | ... | Total
+#
+# It runs on its own STATS_INTERVAL (default 300s / 5min) — much slower
+# than POLL_INTERVAL — since counting doesn't need to be near-real-time
+# and re-reading full sheets on every tick would otherwise add avoidable
+# load on top of the resolution workers.
+#
+# Title/Author for the summary are pulled from the shared DB cache
+# sheet (lookup_db_cache), so no extra Google/OpenLibrary API calls are
+# made just for stats — if an ISBN hasn't been resolved yet those
+# columns are simply left blank until resolve() fills the DB cache in
+# through the normal sync flow.
+# =============================================
+def _stats_sources() -> list[dict]:
+    """
+    Sources counted toward inventory stats. A source is excluded by
+    setting "include_in_stats": false on it in INPUT_SOURCES_JSON — e.g.
+    a testing/sandbox source that should still go through normal ISBN
+    resolution (source_worker) but must not affect inventory counts.
+    Defaults to included if the key is absent.
+    """
+    return [s for s in INPUT_SOURCES if s.get("include_in_stats", True)]
+
+
+def compute_isbn_frequency() -> dict:
+    """
+    Reads the ISBN column of every stats-eligible input source independently
+    and counts occurrences per source. Sources marked
+    include_in_stats: false (e.g. a testing source) are skipped entirely.
+    Returns: {isbn: {source_name: count, ...}, ...}
+    """
+    freq_by_source = {}
+    for source in _stats_sources():
+        rows = read_input_sheet(source["spreadsheet_token"], source["sheet_id"])
+        isbns = [r["isbn"] for r in rows if r.get("isbn")]
+        freq_by_source[source["name"]] = Counter(isbns)
+
+    all_isbns = set()
+    for counter in freq_by_source.values():
+        all_isbns.update(counter.keys())
+
+    merged = {}
+    for isbn in all_isbns:
+        merged[isbn] = {name: freq_by_source[name].get(isbn, 0) for name in freq_by_source}
+    return merged
+
+
+def _col_letter(n: int) -> str:
+    """1 -> A, 2 -> B, ... 27 -> AA (simple A1-notation column helper)"""
+    result = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def write_stats(merged: dict):
+    """
+    Full overwrite of the stats output sheet with the latest counts.
+    Columns: ISBN | <source1> | <source2> | ... | Total
+    """
+    if not STATS_OUTPUT_TOKEN or not STATS_OUTPUT_SHEET_ID:
+        log.warning("[stats] STATS_OUTPUT_SPREADSHEET_TOKEN / STATS_OUTPUT_SHEET_ID not configured — skipping write")
+        return
+
+    source_names = [s["name"] for s in _stats_sources()]
+    header = ["ISBN"] + source_names + ["Total"]
+    rows = [header]
+
+    for isbn, counts in sorted(merged.items(), key=lambda kv: -sum(kv[1].values())):
+        per_source = [counts.get(name, 0) for name in source_names]
+        rows.append([isbn] + per_source + [sum(per_source)])
+
+    last_col = _col_letter(len(header))
+    payload_body = {"valueRange": {
+        "range": f"{STATS_OUTPUT_SHEET_ID}!A1:{last_col}{len(rows)}",
+        "values": rows,
+    }}
+
+    def _do(force_refresh: bool):
+        r = requests.put(
+            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{STATS_OUTPUT_TOKEN}/values",
+            headers=headers(force_refresh),
+            data=json.dumps(payload_body),
+            timeout=15,
+        )
+        return r.json()
+
+    result = _do(False)
+    if _is_invalid_token_response(result):
+        log.warning("[stats] Access token rejected writing stats; forcing refresh and retrying")
+        invalidate_token()
+        result = _do(True)
+
+    if result.get("code", 0) != 0:
+        log.error(f"[stats] Write failed: {result}")
+
+
+def stats_worker():
+    log.info(f"[stats] worker started, interval={STATS_INTERVAL}s")
+    while True:
+        try:
+            merged = compute_isbn_frequency()
+            write_stats(merged)
+            log.info(f"[stats] Updated frequency for {len(merged)} distinct ISBN(s) across {len(INPUT_SOURCES)} source(s)")
+        except Exception as e:
+            log.error(f"[stats] error: {e}")
+        time.sleep(STATS_INTERVAL)
+
+# =============================================
 # Main — spins up one worker thread per source, plus the cache reset
-# worker, then just watches them.
+# worker and the stats worker, then just watches them.
 # =============================================
 def main():
     log.info("=" * 50)
@@ -629,6 +761,7 @@ def main():
     log.info(f"Poll interval: {POLL_INTERVAL}s")
     log.info(f"Input sources: {[s['name'] for s in INPUT_SOURCES]} (independent per-source workers)")
     log.info(f"In-process cache reset times: {CACHE_RESET_TIMES} ({LOCAL_TZ})")
+    log.info(f"Stats interval: {STATS_INTERVAL}s -> {STATS_OUTPUT_TOKEN or '(not configured)'}/{STATS_OUTPUT_SHEET_ID or '(not configured)'}")
     if hasattr(signal, "SIGUSR1"):
         signal.signal(signal.SIGUSR1, _handle_manual_reset_signal)
         log.info("Manual cache reset: kill -USR1 <pid>, or `systemctl kill -s SIGUSR1 isbn_sync`")
@@ -653,9 +786,13 @@ def main():
     cache_thread.start()
     threads["cache_reset"] = (cache_thread, None)
 
+    stats_thread = threading.Thread(target=stats_worker, daemon=True, name="stats")
+    stats_thread.start()
+    threads["stats"] = (stats_thread, None)
+
     # Main thread just supervises: if a worker thread dies unexpectedly
-    # (shouldn't normally happen since sync_source errors are caught
-    # inside the loop), restart it rather than silently losing that
+    # (shouldn't normally happen since sync_source/stats errors are caught
+    # inside their own loops), restart it rather than silently losing that
     # source's polling forever.
     while True:
         time.sleep(30)
@@ -664,6 +801,8 @@ def main():
                 log.error(f"[{name}] worker thread died — restarting")
                 if name == "cache_reset":
                     new_t = threading.Thread(target=cache_reset_worker, daemon=True, name=name)
+                elif name == "stats":
+                    new_t = threading.Thread(target=stats_worker, daemon=True, name=name)
                 else:
                     new_t = threading.Thread(target=source_worker, args=(source,), daemon=True, name=name)
                 new_t.start()
