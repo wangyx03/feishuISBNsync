@@ -698,10 +698,48 @@ def _col_letter(n: int) -> str:
     return result
 
 
+def _current_stats_row_count() -> int:
+    """
+    Queries the stats output sheet for how many rows currently have
+    content (by reading column A). Used instead of an in-process counter
+    so that "how far back do we need to clear" survives process restarts
+    — an in-memory counter would reset to 0 on every restart and forget
+    about a much wider write from an earlier session, leaving those old
+    rows stuck forever. Costs one extra read per stats cycle (every
+    STATS_INTERVAL, so negligible).
+    """
+    if not STATS_OUTPUT_TOKEN or not STATS_OUTPUT_SHEET_ID:
+        return 0
+
+    def _do(force_refresh: bool):
+        r = requests.get(
+            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{STATS_OUTPUT_TOKEN}/values/{STATS_OUTPUT_SHEET_ID}!A1:A5000",
+            headers=headers(force_refresh),
+            timeout=15,
+        )
+        return r.json()
+
+    payload = _do(False)
+    if _is_invalid_token_response(payload):
+        invalidate_token()
+        payload = _do(True)
+
+    if payload.get("code", 0) != 0:
+        log.warning(f"[stats] Could not read existing stats sheet row count: {payload}")
+        return 0
+
+    rows = payload.get("data", {}).get("valueRange", {}).get("values", [])
+    return len(rows)
+
+
 def write_stats(merged: dict):
     """
     Full overwrite of the stats output sheet with the latest counts.
     Columns: ISBN | <source1> | <source2> | ... | Total
+    Also blanks out any leftover rows from a previous, longer write —
+    checked against the sheet's ACTUAL current row count (not an
+    in-process counter) so stale ("zombie") rows get cleared even after
+    a daemon restart.
     """
     if not STATS_OUTPUT_TOKEN or not STATS_OUTPUT_SHEET_ID:
         log.warning("[stats] STATS_OUTPUT_SPREADSHEET_TOKEN / STATS_OUTPUT_SHEET_ID not configured — skipping write")
@@ -715,7 +753,18 @@ def write_stats(merged: dict):
         per_source = [counts.get(name, 0) for name in source_names]
         rows.append([isbn] + per_source + [sum(per_source)])
 
-    last_col = _col_letter(len(header))
+    num_cols = len(header)
+    last_col = _col_letter(num_cols)
+
+    # Pad with fully-blank rows up to the sheet's ACTUAL current size,
+    # so any rows this round doesn't use get explicitly cleared instead
+    # of left with a previous, wider write's stale values.
+    existing_row_count = _current_stats_row_count()
+    total_rows_to_write = max(len(rows), existing_row_count)
+    blank_row = [""] * num_cols
+    while len(rows) < total_rows_to_write:
+        rows.append(blank_row)
+
     payload_body = {"valueRange": {
         "range": f"{STATS_OUTPUT_SHEET_ID}!A1:{last_col}{len(rows)}",
         "values": rows,
