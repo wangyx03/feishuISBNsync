@@ -175,9 +175,45 @@ def _is_invalid_token_response(payload: dict) -> bool:
 # ISBN Cleaning
 # =============================================
 def clean_isbn(raw) -> str:
+    """
+    Normalize a raw cell value into a plain digit-only ISBN string.
+
+    IMPORTANT — bug history: this used to do
+        str(int(float(s))) if s else ""
+    for anything that wasn't caught by the except branch. That's fine for
+    values like "9780593437476" (no decimal point — float() just round-trips
+    it exactly, since Python's float has enough precision for a 13-digit
+    integer). But if the upstream source (OCR / barcode recognition, manual
+    entry, a spreadsheet auto-formatting a cell, etc.) ever produces a value
+    that ACTUALLY contains a decimal point — e.g. "9.780593437476" instead of
+    "9780593437476" — then float(s) parses it as the real number ~9.78, and
+    int(...) truncates it down to just "9". Two completely different ISBNs
+    mangled this way (e.g. "9.780593437476" and "9.781728297149") can both
+    collapse to "9", which then makes resolve()'s per-ISBN lock/cache treat
+    them as the SAME book — corrupting both rows with whichever one resolved
+    first.
+
+    Fix: if the string contains a literal decimal point and isn't scientific
+    notation, treat it as mangled digits and just strip non-digit characters
+    directly, instead of round-tripping through float/int (which silently
+    truncates instead of erroring).
+    """
     if raw is None:
         return ""
     s = str(raw).strip()
+    if not s:
+        return ""
+
+    has_dot = "." in s
+    is_scientific = "e" in s.lower()
+
+    if has_dot and not is_scientific:
+        # A decimal point here almost certainly means the ISBN got mangled
+        # upstream (e.g. "9.780593437476"). Don't let float()/int() silently
+        # truncate it to "9" — pull the digits out directly instead so all
+        # 13 (or 10) digits survive.
+        return "".join(c for c in s if c.isdigit())
+
     try:
         return str(int(float(s))) if s else ""
     except (ValueError, OverflowError):
@@ -219,6 +255,18 @@ def read_input_sheet(spreadsheet_token: str, sheet_id: str) -> list[dict]:
             val = padded[j]
             rec[col] = clean_isbn(val) if col == "isbn" else ("" if val is None else str(val).strip())
         if rec.get("isbn"):
+            # Sanity check: a real ISBN-10/ISBN-13 is always 10 or 13 digits.
+            # If clean_isbn() produced something shorter/longer, the source
+            # value was malformed (truncated float, partial OCR read, etc.)
+            # — skip it rather than silently resolving/writing garbage that
+            # could collide in the cache with an unrelated ISBN.
+            isbn_len = len(rec["isbn"])
+            if isbn_len not in (10, 13):
+                log.warning(
+                    f"  ⚠️  Row {i}: suspicious ISBN '{rec['isbn']}' "
+                    f"(len={isbn_len}, raw={padded[header.index('isbn')]!r}) — skipping"
+                )
+                continue
             records.append(rec)
     return records
 
@@ -462,6 +510,14 @@ def lookup_openlibrary(isbn: str):
 # actually found in the persisted Feishu DB-cache sheet. Watch for the
 # "⚡ reused..." log lines to know when a cache-hit happened vs a fresh
 # lookup, since the printed condition alone can't tell you that.
+#
+# NOTE: this lock/cache is keyed by the ISBN string produced by
+# clean_isbn(). It is only as correct as that key — if clean_isbn() ever
+# collapses two different ISBNs to the same string (as it used to for
+# malformed "9.780593437476"-style values, see clean_isbn()'s docstring),
+# this whole mechanism will confidently and silently treat them as one
+# book. read_input_sheet() now filters out any ISBN that isn't exactly
+# 10 or 13 digits after cleaning, as a second line of defense.
 # =============================================
 _isbn_locks: dict[str, threading.Lock] = {}
 _isbn_locks_guard = threading.Lock()
