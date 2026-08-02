@@ -40,6 +40,7 @@ import os
 import json
 import time
 import logging
+import logging.handlers
 import threading
 import datetime
 import signal
@@ -113,13 +114,21 @@ else:
 # =============================================
 # Logging
 # =============================================
+# =============================================
+# Logging
+# Rotates daily at midnight (local time), keeps the last 7 days of logs,
+# then deletes older ones automatically — self-contained, doesn't depend
+# on the server having its own logrotate config for this file.
+# =============================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("sku_sync.log", encoding="utf-8"),
+        logging.handlers.TimedRotatingFileHandler(
+            "sku_sync.log", when="midnight", backupCount=7, encoding="utf-8"
+        ),
     ],
 )
 log = logging.getLogger(__name__)
@@ -246,6 +255,10 @@ def read_input_sheet(spreadsheet_token: str, sheet_id: str) -> list[dict]:
         return []
 
     header = [str(h).strip().lower() for h in rows[0]]
+    # The sheets themselves may still literally say "ISBN" in the header
+    # cell (we renamed the code's internal field to "sku", not the sheet
+    # text) — normalize so either spelling maps to the same internal key.
+    header = ["sku" if h == "isbn" else h for h in header]
     records = []
     for i, row in enumerate(rows[1:], start=2):
         padded = row + [None] * max(0, len(header) - len(row))
