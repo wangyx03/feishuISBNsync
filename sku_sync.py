@@ -34,6 +34,14 @@ separate output sheet. This runs on its own, much slower interval so it
 never competes with the real-time resolution workers for API/rate-limit
 budget.
 
+Finally, an "archive" worker takes a daily UPSERT snapshot of that
+same frequency data and writes it to a separate archive sheet, tagged
+with the date. This exists because the live stats sheet above is a
+real-time OVERWRITE — it only ever shows "right now", and the underlying
+input sheets get cleared manually every day, so without this archive any
+given day's numbers are gone as soon as the sheets are cleared. For the same local date, later snapshots replace earlier rows for the same day; older dates remain untouched and runs completely independently of the real-time
+stats sheet, so it can't affect real-time inventory visibility.
+
 Usage: python sku_sync.py
 """
 import os
@@ -69,16 +77,27 @@ STATS_INTERVAL          = int(os.getenv("STATS_INTERVAL", "300"))  # seconds; sl
 STATS_OUTPUT_TOKEN      = os.getenv("STATS_OUTPUT_SPREADSHEET_TOKEN", "")
 STATS_OUTPUT_SHEET_ID   = os.getenv("STATS_OUTPUT_SHEET_ID", "")
 
+# --- Live copy of 今日销售 (same 5-minute overwrite data) ---
+TODAY_SALES_COPY_TOKEN    = os.getenv("TODAY_SALES_COPY_SPREADSHEET_TOKEN", "Z0nQsiilShISpXttzkXcJEbqnEc")
+TODAY_SALES_COPY_SHEET_ID = os.getenv("TODAY_SALES_COPY_SHEET_ID", "cN4OUQ")
+
+# --- Daily archive snapshot config ---
+# Separate sheet from STATS_OUTPUT_* above — the live stats sheet is a
+# real-time overwrite, this one is an append-only daily history so a
+# week's worth of numbers survive the daily manual clearing of the
+# input sheets. Cleanup (deleting old weeks) is manual, done by the user.
+ARCHIVE_TOKEN    = os.getenv("ARCHIVE_SPREADSHEET_TOKEN", "Z0nQsiilShISpXttzkXcJEbqnEc")
+ARCHIVE_SHEET_ID = os.getenv("ARCHIVE_SHEET_ID", "WbeZTS")
+ARCHIVE_TIME     = [(8, 0)]  # (hour, minute) local time — daily snapshot at 8am
+
 # Feishu error code for "invalid/expired access token"
 FEISHU_INVALID_TOKEN_CODE = 99991663
 
 # =============================================
-# In-process resolve() cache reset schedule
-# The whole _memory_cache dict is cleared at these local times every day
-# (24h clock), so manual edits to the DB cache sheet are re-read within
-# a bounded window instead of being masked forever by a stale in-memory
-# result. Timezone is explicit so this doesn't depend on the server's
-# system timezone (which is UTC) — DST is handled automatically.
+# Scheduling — in-process cache reset AND the daily archive snapshot both
+# fire at fixed local times every day. Timezone is explicit so this
+# doesn't depend on the server's system timezone (which is UTC) — DST is
+# handled automatically.
 # =============================================
 LOCAL_TZ = ZoneInfo("America/Detroit")
 CACHE_RESET_TIMES = [(0, 0)]  # (hour, minute) pairs, 24h clock, local time
@@ -111,9 +130,6 @@ if _input_sources_json:
 else:
     INPUT_SOURCES = DEFAULT_INPUT_SOURCES
 
-# =============================================
-# Logging
-# =============================================
 # =============================================
 # Logging
 # Rotates daily at midnight (local time), keeps the last 7 days of logs,
@@ -502,15 +518,13 @@ def _resolve_uncached(sku: str) -> tuple[str, str, str, str, str, str, str]:
     return title, author, binding, date, lang, pages, condition
 
 # =============================================
-# Daily cache reset worker
-# Wipes the entire in-process _memory_cache at fixed local times each day
-# (America/Detroit, DST-aware), so resolve() re-reads the DB cache sheet
-# (and re-hits the APIs if still not found there) after each reset,
-# picking up any manual edits made to the DB sheet in the meantime.
+# Scheduling helper — shared by the daily cache reset AND the daily
+# archive snapshot. Given a list of (hour, minute) local-time pairs,
+# returns the soonest one that's still in the future.
 # =============================================
-def _next_reset_time(now: datetime.datetime) -> datetime.datetime:
+def _next_scheduled_time(now: datetime.datetime, times: list[tuple[int, int]]) -> datetime.datetime:
     candidates = []
-    for h, m in CACHE_RESET_TIMES:
+    for h, m in times:
         candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
         if candidate <= now:
             candidate += datetime.timedelta(days=1)
@@ -518,6 +532,21 @@ def _next_reset_time(now: datetime.datetime) -> datetime.datetime:
     return min(candidates)
 
 
+def _next_reset_time(now: datetime.datetime) -> datetime.datetime:
+    return _next_scheduled_time(now, CACHE_RESET_TIMES)
+
+
+def _next_archive_time(now: datetime.datetime) -> datetime.datetime:
+    return _next_scheduled_time(now, ARCHIVE_TIME)
+
+
+# =============================================
+# Daily cache reset worker
+# Wipes the entire in-process _memory_cache at fixed local times each day
+# (America/Detroit, DST-aware), so resolve() re-reads the DB cache sheet
+# (and re-hits the APIs if still not found there) after each reset,
+# picking up any manual edits made to the DB sheet in the meantime.
+# =============================================
 def _clear_memory_cache(reason: str):
     with _memory_cache_lock:
         count = len(_memory_cache)
@@ -656,22 +685,15 @@ def _col_letter(n: int) -> str:
     return result
 
 
-def _current_stats_row_count() -> int:
+def _sheet_row_count(spreadsheet_token: str, sheet_id: str) -> int:
     """
-    Queries the stats output sheet for how many rows currently have
-    content (by reading column A). Used instead of an in-process counter
-    so that "how far back do we need to clear" survives process restarts
-    — an in-memory counter would reset to 0 on every restart and forget
-    about a much wider write from an earlier session, leaving those old
-    rows stuck forever. Costs one extra read per stats cycle (every
-    STATS_INTERVAL, so negligible).
+    Generic helper: how many rows currently have content in column A of
+    the given sheet. Used to decide whether to write a header row (empty
+    sheet) and where subsequent writes/appends should start.
     """
-    if not STATS_OUTPUT_TOKEN or not STATS_OUTPUT_SHEET_ID:
-        return 0
-
     def _do(force_refresh: bool):
         r = requests.get(
-            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{STATS_OUTPUT_TOKEN}/values/{STATS_OUTPUT_SHEET_ID}!A1:A5000",
+            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values/{sheet_id}!A1:A5000",
             headers=headers(force_refresh),
             timeout=15,
         )
@@ -683,24 +705,33 @@ def _current_stats_row_count() -> int:
         payload = _do(True)
 
     if payload.get("code", 0) != 0:
-        log.warning(f"[stats] Could not read existing stats sheet row count: {payload}")
+        log.warning(f"[row_count] Could not read row count for ({spreadsheet_token}/{sheet_id}): {payload}")
         return 0
 
     rows = payload.get("data", {}).get("valueRange", {}).get("values", [])
-    return len(rows)
+    # IMPORTANT: Feishu pads the returned values array out to the FULL
+    # requested range (here, 5000 rows) even for cells that have no
+    # content — so raw len(rows) is basically always ~5000 regardless of
+    # how much real data is in the sheet. Trim trailing rows whose
+    # column-A cell is empty/None to get the actual "how many rows have
+    # content" count. Without this, archive/stats writes would always
+    # think the sheet already has ~5000 rows and start appending way
+    # past the real data (bug found: first archive write landed at row
+    # 5001 on a sheet that was actually empty).
+    count = len(rows)
+    while count > 0:
+        cell = rows[count - 1][0] if rows[count - 1] else None
+        if cell is None or str(cell).strip() == "":
+            count -= 1
+        else:
+            break
+    return count
 
 
-def write_stats(merged: dict):
-    """
-    Full overwrite of the stats output sheet with the latest counts.
-    Columns: SKU | <source1> | <source2> | ... | Total
-    Also blanks out any leftover rows from a previous, longer write —
-    checked against the sheet's ACTUAL current row count (not an
-    in-process counter) so stale ("zombie") rows get cleared even after
-    a daemon restart.
-    """
-    if not STATS_OUTPUT_TOKEN or not STATS_OUTPUT_SHEET_ID:
-        log.warning("[stats] STATS_OUTPUT_SPREADSHEET_TOKEN / STATS_OUTPUT_SHEET_ID not configured — skipping write")
+def _write_stats_sheet(spreadsheet_token: str, sheet_id: str, merged: dict, label: str):
+    """Overwrite one live stats sheet and clear stale leftover rows."""
+    if not spreadsheet_token or not sheet_id:
+        log.warning(f"[{label}] spreadsheet token / sheet id not configured — skipping write")
         return
 
     source_names = [s["name"] for s in _stats_sources()]
@@ -714,23 +745,21 @@ def write_stats(merged: dict):
     num_cols = len(header)
     last_col = _col_letter(num_cols)
 
-    # Pad with fully-blank rows up to the sheet's ACTUAL current size,
-    # so any rows this round doesn't use get explicitly cleared instead
-    # of left with a previous, wider write's stale values.
-    existing_row_count = _current_stats_row_count()
+    # Clear rows left behind by an earlier, longer result.
+    existing_row_count = _sheet_row_count(spreadsheet_token, sheet_id)
     total_rows_to_write = max(len(rows), existing_row_count)
     blank_row = [""] * num_cols
     while len(rows) < total_rows_to_write:
         rows.append(blank_row)
 
     payload_body = {"valueRange": {
-        "range": f"{STATS_OUTPUT_SHEET_ID}!A1:{last_col}{len(rows)}",
+        "range": f"{sheet_id}!A1:{last_col}{len(rows)}",
         "values": rows,
     }}
 
     def _do(force_refresh: bool):
         r = requests.put(
-            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{STATS_OUTPUT_TOKEN}/values",
+            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{spreadsheet_token}/values",
             headers=headers(force_refresh),
             data=json.dumps(payload_body),
             timeout=15,
@@ -739,12 +768,24 @@ def write_stats(merged: dict):
 
     result = _do(False)
     if _is_invalid_token_response(result):
-        log.warning("[stats] Access token rejected writing stats; forcing refresh and retrying")
+        log.warning(f"[{label}] Access token rejected; forcing refresh and retrying")
         invalidate_token()
         result = _do(True)
 
     if result.get("code", 0) != 0:
-        log.error(f"[stats] Write failed: {result}")
+        log.error(f"[{label}] Write failed: {result}")
+    else:
+        log.info(f"[{label}] Updated {len(merged)} distinct SKU(s)")
+
+
+def write_stats(merged: dict):
+    """
+    Overwrite the original 今日销售 sheet and place an identical live copy
+    in TODAY_SALES_COPY_TOKEN / TODAY_SALES_COPY_SHEET_ID.
+    Both destinations update on the same STATS_INTERVAL cycle.
+    """
+    _write_stats_sheet(STATS_OUTPUT_TOKEN, STATS_OUTPUT_SHEET_ID, merged, "stats")
+    _write_stats_sheet(TODAY_SALES_COPY_TOKEN, TODAY_SALES_COPY_SHEET_ID, merged, "today-sales-copy")
 
 
 def stats_worker():
@@ -758,9 +799,197 @@ def stats_worker():
             log.error(f"[stats] error: {e}")
         time.sleep(STATS_INTERVAL)
 
+
+# =============================================
+# Daily archive snapshot worker
+#
+# APPEND-ONLY: takes the same merged frequency data used by stats_worker
+# above and writes one more row per SKU into a separate archive sheet,
+# tagged with today's date, added below whatever's already there. Never
+# overwrites or deletes existing rows — old data cleanup is manual (the
+# user deletes previous weeks themselves).
+#
+# Fires automatically once a day at ARCHIVE_TIME (default 8am local —
+# timed to run before the input sheets get cleared manually each day),
+# and can also be triggered on demand at any time by sending SIGUSR2 to
+# the process, without waiting for the schedule.
+# =============================================
+_archive_write_lock = threading.Lock()
+_archive_trigger = threading.Event()
+
+
+def _read_archive_rows() -> list[list]:
+    """Read the current archive table, trimming fully empty trailing rows."""
+    def _do(force_refresh: bool):
+        r = requests.get(
+            f"{FEISHU_BASE}/sheets/v2/spreadsheets/{ARCHIVE_TOKEN}/values/{ARCHIVE_SHEET_ID}!A1:Z5000",
+            headers=headers(force_refresh),
+            timeout=15,
+        )
+        return r.json()
+
+    payload = _do(False)
+    if _is_invalid_token_response(payload):
+        invalidate_token()
+        payload = _do(True)
+
+    if payload.get("code", 0) != 0:
+        raise RuntimeError(f"Archive read failed: {payload}")
+
+    rows = payload.get("data", {}).get("valueRange", {}).get("values", [])
+    while rows and not any(str(v).strip() for v in rows[-1] if v is not None):
+        rows.pop()
+    return rows
+
+
+def _archive_period_key(dt: datetime.datetime) -> str:
+    """Return the business-date key for the 08:00-to-next-08:00 archive window."""
+    boundary_hour, boundary_minute = ARCHIVE_TIME[0]
+    boundary = dt.replace(hour=boundary_hour, minute=boundary_minute, second=0, microsecond=0)
+    if dt < boundary:
+        dt -= datetime.timedelta(days=1)
+    return dt.strftime("%Y-%m-%d")
+
+
+def _row_archive_period_key(row) -> str:
+    """Derive an existing archive row's 08:00 business-date key."""
+    if not row:
+        return ""
+    raw = str(row[0]).strip()
+    try:
+        row_dt = datetime.datetime.strptime(raw, "%Y-%m-%d %H:%M").replace(tzinfo=LOCAL_TZ)
+    except ValueError:
+        # Unknown/legacy timestamp format: preserve it rather than deleting data.
+        return ""
+    return _archive_period_key(row_dt)
+
+
+def write_archive_snapshot(merged: dict):
+    """
+    Archive UPSERT using an 08:00-to-next-08:00 business-day window.
+
+    Unique key: archive period + SKU. For example, every snapshot from
+    2026-08-06 08:00 through 2026-08-07 07:59 belongs to period 2026-08-06.
+    A later startup/manual/scheduled snapshot within that same window replaces
+    the earlier rows for the window instead of appending duplicates.
+
+    Columns: Snapshot Time | SKU | <source1> | <source2> | ... | Total
+    """
+    if not ARCHIVE_TOKEN or not ARCHIVE_SHEET_ID:
+        log.warning("[archive] ARCHIVE_SPREADSHEET_TOKEN / ARCHIVE_SHEET_ID not configured — skipping snapshot")
+        return
+
+    source_names = [s["name"] for s in _stats_sources()]
+    header = ["Snapshot Time", "SKU"] + source_names + ["Total"]
+    now = datetime.datetime.now(LOCAL_TZ)
+    snapshot_str = now.strftime("%Y-%m-%d %H:%M")
+    period_key = _archive_period_key(now)
+
+    new_rows = []
+    for sku, counts in sorted(merged.items(), key=lambda kv: -sum(kv[1].values())):
+        per_source = [counts.get(name, 0) for name in source_names]
+        new_rows.append([snapshot_str, sku] + per_source + [sum(per_source)])
+
+    if not new_rows:
+        log.info("[archive] No SKUs to snapshot, skipping")
+        return
+
+    with _archive_write_lock:
+        existing = _read_archive_rows()
+
+        # Preserve all other 08:00-based periods, but remove every row from
+        # the current period. This guarantees one row per (period, SKU).
+        preserved = []
+        for row in existing[1:] if existing else []:
+            if _row_archive_period_key(row) != period_key:
+                preserved.append(row)
+
+        rows = [header] + preserved + new_rows
+        num_cols = len(header)
+        last_col = _col_letter(num_cols)
+
+        # Clear any old trailing rows left by a previously longer version.
+        old_count = max(len(existing), 1)
+        total_rows_to_write = max(len(rows), old_count)
+        blank_row = [""] * num_cols
+        while len(rows) < total_rows_to_write:
+            rows.append(blank_row)
+
+        payload_body = {"valueRange": {
+            "range": f"{ARCHIVE_SHEET_ID}!A1:{last_col}{len(rows)}",
+            "values": rows,
+        }}
+
+        def _do(force_refresh: bool):
+            r = requests.put(
+                f"{FEISHU_BASE}/sheets/v2/spreadsheets/{ARCHIVE_TOKEN}/values",
+                headers=headers(force_refresh),
+                data=json.dumps(payload_body),
+                timeout=15,
+            )
+            return r.json()
+
+        result = _do(False)
+        if _is_invalid_token_response(result):
+            log.warning("[archive] Access token rejected writing snapshot; forcing refresh and retrying")
+            invalidate_token()
+            result = _do(True)
+
+        if result.get("code", 0) != 0:
+            log.error(f"[archive] Snapshot write failed: {result}")
+        else:
+            log.info(
+                f"[archive] {snapshot_str} period snapshot upserted: "
+                f"{len(new_rows)} SKU row(s); replaced earlier rows in "
+                f"period {period_key} (08:00-to-next-08:00)"
+            )
+
+
+def _handle_manual_archive_signal(signum, frame):
+    """SIGUSR2 wakes archive_worker immediately for an on-demand snapshot."""
+    _archive_trigger.set()
+
+
+def archive_worker():
+    log.info(
+        f"[archive] worker started, daily snapshot at {ARCHIVE_TIME} ({LOCAL_TZ}) "
+        f"-> {ARCHIVE_TOKEN or '(not configured)'}/{ARCHIVE_SHEET_ID or '(not configured)'}"
+    )
+
+    # Take one snapshot immediately on startup/restart, in addition to the
+    # regular daily schedule below. Without this, a restart shortly after
+    # the daily 8am trigger (or a deploy that happens to land near it) can
+    # silently skip that day's archive entirely, since the loop below only
+    # fires at the next scheduled time. An extra snapshot costs nothing —
+    # it's append-only with its own timestamp, so it just becomes one more
+    # data point for that business day rather than a duplicate/conflict.
+    try:
+        merged = compute_sku_frequency()
+        write_archive_snapshot(merged)
+        log.info("[archive] Startup snapshot written")
+    except Exception as e:
+        log.error(f"[archive] startup snapshot error: {e}")
+
+    while True:
+        now = datetime.datetime.now(LOCAL_TZ)
+        next_time = _next_archive_time(now)
+        sleep_seconds = (next_time - now).total_seconds()
+        log.info(
+            f"[archive] Next scheduled snapshot at {next_time.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"(in {sleep_seconds/3600:.1f}h) — or `kill -USR2 <pid>` to snapshot now"
+        )
+        triggered_manually = _archive_trigger.wait(timeout=sleep_seconds)
+        _archive_trigger.clear()
+        try:
+            merged = compute_sku_frequency()
+            write_archive_snapshot(merged)
+            log.info(f"[archive] Done ({'manual trigger' if triggered_manually else 'scheduled 8am'})")
+        except Exception as e:
+            log.error(f"[archive] error: {e}")
+
 # =============================================
 # Main — spins up one worker thread per source, plus the cache reset
-# worker and the stats worker, then just watches them.
+# worker, the stats worker, and the archive worker, then just watches them.
 # =============================================
 def main():
     log.info("=" * 50)
@@ -769,6 +998,8 @@ def main():
     log.info(f"Input sources: {[s['name'] for s in INPUT_SOURCES]} (independent per-source workers)")
     log.info(f"In-process cache reset times: {CACHE_RESET_TIMES} ({LOCAL_TZ})")
     log.info(f"Stats interval: {STATS_INTERVAL}s -> {STATS_OUTPUT_TOKEN or '(not configured)'}/{STATS_OUTPUT_SHEET_ID or '(not configured)'}")
+    log.info(f"Today-sales live copy: {TODAY_SALES_COPY_TOKEN or '(not configured)'}/{TODAY_SALES_COPY_SHEET_ID or '(not configured)'}")
+    log.info(f"Archive snapshot time: {ARCHIVE_TIME} ({LOCAL_TZ}) -> {ARCHIVE_TOKEN or '(not configured)'}/{ARCHIVE_SHEET_ID or '(not configured)'}")
     if hasattr(signal, "SIGUSR1"):
         signal.signal(signal.SIGUSR1, _handle_manual_reset_signal)
         log.info("Manual cache reset: kill -USR1 <pid>, or `systemctl kill -s SIGUSR1 sku_sync`")
@@ -781,6 +1012,12 @@ def main():
         log.info("Manual cache reset (local Windows testing): press Ctrl+Break in this terminal")
     else:
         log.info("Manual cache reset signal is unavailable on this platform — skipped")
+
+    if hasattr(signal, "SIGUSR2"):
+        signal.signal(signal.SIGUSR2, _handle_manual_archive_signal)
+        log.info("Manual archive snapshot: kill -USR2 <pid>, or `systemctl kill -s SIGUSR2 sku_sync`")
+    else:
+        log.info("Manual archive snapshot signal is unavailable on this platform — skipped (scheduled snapshot still runs)")
     log.info("=" * 50)
 
     threads = {}
@@ -797,6 +1034,10 @@ def main():
     stats_thread.start()
     threads["stats"] = (stats_thread, None)
 
+    archive_thread = threading.Thread(target=archive_worker, daemon=True, name="archive")
+    archive_thread.start()
+    threads["archive"] = (archive_thread, None)
+
     # Main thread just supervises: if a worker thread dies unexpectedly
     # (shouldn't normally happen since sync_source/stats errors are caught
     # inside their own loops), restart it rather than silently losing that
@@ -810,6 +1051,8 @@ def main():
                     new_t = threading.Thread(target=cache_reset_worker, daemon=True, name=name)
                 elif name == "stats":
                     new_t = threading.Thread(target=stats_worker, daemon=True, name=name)
+                elif name == "archive":
+                    new_t = threading.Thread(target=archive_worker, daemon=True, name=name)
                 else:
                     new_t = threading.Thread(target=source_worker, args=(source,), daemon=True, name=name)
                 new_t.start()
